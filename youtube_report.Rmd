@@ -1,0 +1,625 @@
+---
+title: "678_report"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+#This report will analyse the factors about a video's views according to its first day and last day records in trending list of YouTube in United States. Generally, the number of views, likes, dislikes and comments in first day directly impact a video's populatity. Meanwhile, the video category and channel should be considered as potential factors. 
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#library relevant package
+library(arm)
+library(car)
+library(readr)
+library(jsonlite)
+library(lubridate)
+library(tidyverse)
+library(magrittr)
+library(data.table)
+library(ggcorrplot)
+library(lme4)
+library(gridExtra)
+library(gvlma)
+```
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#set working directory and read data 
+setwd("~/Desktop/678_final_project/youtube-new")
+us<-read_csv("USvideos.csv") ##define the format for each columns
+#40949 rows, 16 columns totally in original dataset
+sapply(us, function(x) sum(is.na(x)))
+```
+#the first dataset is downloaded from Kaggle. other people scraped data by YouTbue's API and shared the data in Kaggle. The dataset recorded the number of views, likes and comments of videos from the first day to the last day as a trending video in YouTube. Meanwhile, it included other information about the trending videos, like video title, brief description, categoryID, its trending date and publish date and kinds of tag attached.
+
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+us_refer<-data.frame(fromJSON(txt = "US_category_id.json",simplifyDataFrame = TRUE))
+us_refer<-as.data.frame(cbind(us_refer$items.id,us_refer$items.snippet$title,us_refer$items.snippet$assignable))
+colnames(us_refer)<-c("category_id","category","assignable")
+us_refer$category_id<-as.character(us_refer$category_id)
+us_refer$category_id<-as.numeric(us_refer$category_id)
+
+#merge with category list
+us<-left_join(us,us_refer,by="category_id")
+us %<>% distinct() 
+```
+#The second dataset is the reference of categoryID, which records the corresponding category of video. joining them as a bigger dataset.
+
+
+
+
+#there are many videos in trending list for a long time, these data was collected daliy, so it were mulitple recorded. Trying to extract some useful variables from the original dataset, like the number of day of trending, the number of tags, the month of trending (consider the interaction of category and trending month has effect on views, some special events and holidays happended in a specific month,the corresponding category videos more likely to be searched and watched, i expected the interation of video category and month is a good predictor) is a necessary step. After that, setting the views in the latest record for each video as the outcome and the relevant record about each videos in the first and last day as potential predictors. 
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#change the date format and extract trending month
+us$trending_date<-ydm(us$trending_date)
+us$month<-month(us$publish_time)
+
+range(us$trending_date) 
+#from "2017-11-14" to "2018-06-14"
+#the month of dataset is not overlop, ignore year's feature
+
+#extract trending period (suppose the trending days are longer, the viewers are more)
+#and exclude the videos with some functions are blocked
+us1<- us %>% group_by(video_id) %>% distinct() %>% mutate(n=1) %>% mutate(trending_day=sum(n)) %>% ungroup() %>% 
+  filter(comments_disabled!="True" & ratings_disabled!="True" & video_error_or_removed!="True")
+
+#check correct  
+table(us1$ratings_disabled)
+table(us1$comments_disabled)
+table(us1$video_error_or_removed)
+
+
+#each unique video has been recorded by each days until it was dropped from trending list
+#split the dataset into two, one is the first record, another one is the last record by each video 
+trending_start<- us1 %>% group_by(video_id) %>% filter(views==head(views,n=1)) %>% distinct() 
+
+#set the last day views as the model's outcome
+trending_over <-us1 %>% group_by(video_id) %>% filter(views==tail(views,n=1)) %>% distinct() %>%  
+  dplyr::select(video_id,views,likes,dislikes) 
+
+colnames(trending_over)<-c("video_id","final_views","final_likes","final_dislikes")
+
+#join the two dataset by each videoID
+#reshape the dataset, the views in trending_over is the outcome 
+trending_start<-inner_join(trending_start,trending_over,by="video_id") 
+
+
+#only consider the trending period longer than 1 day
+trending_start %<>% filter(trending_day>1)
+
+#extract the number of tags
+#in common, the tags is more, the viewer is more
+tag<-data.frame(trending_start$video_id,trending_start$tags)
+tag_split<-data.frame(tstrsplit(tag$trending_start.tags, '\"|\"',fill = NA,fix=TRUE))
+colnames(tag_split)<-c(1:69)
+tag_split<- as.data.frame(t(tag_split))
+tag_split %<>% gather(video,tags,V1:V5541,na.rm = TRUE) 
+tag_split %<>% group_by(video) %>% mutate(n=1) %>% mutate(N=sum(n)) 
+none_tag<-tag_split %>% filter(tags=="[none]") %>% mutate(N=0)
+have_tag<-tag_split %>% filter(tags!="[none]")
+tag_split<-rbind(have_tag,none_tag)
+tag_number <- tag_split %>% dplyr::select(video,N) %>% distinct()
+trending_start$tag_count<-tag_number$N 
+
+
+#delete unuesful columns
+trending_start %<>% dplyr::select(-c("title","category_id","tags","publish_time","thumbnail_link","comments_disabled",
+                              "ratings_disabled","video_error_or_removed","description","assignable","n"))
+```
+
+
+#in the following analysis, it is easily to notice that the average views differ among channels, it probably result from the features of channel. Socialblade (https://socialblade.com/youtube/top/5000) is a well known company which maintains statistics of YouTube channels, their website features a page which shows Top 5000 YouTube channels and some basic information about them, such as: the Socialblade channel rankings, the grades granted by Socialblade, the YouTube channel name, the number of videos uploaded by the channel, total number of subscribers on the channel and the total number of views on all the video content by the channel. A person scarped the data from the past half year and shared them in Kaggle (https://www.kaggle.com/mdhrumil/top-5000-youtube-channels-data-from-socialblade). These metrics be used for finding useful insights and the revealing possible correlations between the features of the channels and their video's view. The another dataset for trending videos was collected from 2017-11-14 to 2018-06-14, although the record periods are not complete overlap, the infromation still may reflect overall competitiveness of channel.
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#take consideration in feature of channels
+#import data and change the data structure 
+channel<-read_csv("data.csv")
+sapply(channel, function(x)sum(is.na(x)))
+
+channel$Subscribers<-as.numeric(channel$Subscribers)
+channel$`Video Uploads`<-as.numeric(channel$`Video Uploads`)
+unique(channel$Grade)
+
+#select useful predictors
+channel_1 <-channel%>%
+  dplyr::select(`Channel name`,
+         Subscribers,`Video Uploads`,`Video views`,Grade)
+
+#join the channel information with original data
+#however, the dataset about channel only have the record of top 5000 channels in the past half year
+#so after inner joining, many data points are removed, only leave 2162 rows
+trending_start<-inner_join(trending_start,channel_1,by=c("channel_title"="Channel name"))
+
+sapply(trending_start, function(x) sum(is.na(x)))
+
+```
+
+
+
+#check and remove outliers
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#check other potenial veriables and outliers
+
+# setting all 0 values for likes, dislikes and comments as NA
+sapply(trending_start, function(x)sum(is.na(x)))
+range(trending_start$likes)
+range(trending_start$dislikes)
+range(trending_start$comment_count)
+
+
+#clean the data of both of the number of likes and dislike are zero in the last record--> outlier
+#because it does not make sense 
+trending_start %<>%  filter(final_likes!=0 | final_dislikes!=0) 
+
+
+#difine a function to narmalize the numerical features
+z_normalize <- function(x) {
+  return ((x - mean(x)) / sd(x))
+}
+
+
+#normalizing the numerical features
+names(trending_start)
+youtube_norm_basic<-trending_start[,c(4:7,10:11,15:17)]
+youtube_norm <- data.frame(lapply(trending_start[,c(4:7,10:11,15:17)], z_normalize))
+
+# summary of numerical features after normalizing
+summary(youtube_norm) # range of dataset is too big 
+boxplot(youtube_norm)
+```
+# clearly, the range is too large for one dataset, as we can see that the 3rd quartile for most of the numerical features is less than the mean. and, there is a small portion of videos with extremely high number of views. Moreover, the boxplot shows there exactly exsit outliers in the dataset, so moving forward, the data will be divided into two subsets, one with final views less than its median and the other one greater than its median and less or more than 3 sigma videos with other indicators (the number of likes, dislikes and comment, etc.) will be removed in both subsets.
+
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#exist outlier
+summary(trending_start$final_views) 
+
+# removing the rows whose sd greater than 3
+#divide into 2 subsets--> high/low
+#from the summary and boxplot, they show the outlier problem has been improved 
+index_low<-which(trending_start$final_views<=1197284)
+low_youtube_norm<-youtube_norm_basic[index_low,]
+low_youtube_norm<-data.frame(lapply(low_youtube_norm, z_normalize))
+low_youtube_norm<-cbind(index_low,low_youtube_norm)
+low_youtube_norm %<>% filter(likes < 3 & dislikes < 3 & comment_count < 3 & views< 3 )
+low_youtube_norm %>% filter(Subscribers<3 & Video.views<3 & Video.Uploads<3)
+summary(low_youtube_norm)
+boxplot(low_youtube_norm)
+
+
+high_index<-which(trending_start$final_views>1197284)
+high_youtube_norm<-youtube_norm_basic[high_index,]
+high_youtube_norm<-data.frame(lapply(high_youtube_norm, z_normalize))
+high_youtube_norm<-cbind(high_index,high_youtube_norm)
+high_youtube_norm %<>% filter(likes < 3 & dislikes < 3 & comment_count < 3 & views<3)
+high_youtube_norm %>% filter(Subscribers<3 & Video.Uploads<3 & Video.views<3)
+summary(high_youtube_norm)
+boxplot(high_youtube_norm)
+
+
+names(high_youtube_norm)[1]<-"index"
+names(low_youtube_norm)[1]<-"index"
+sd_youtube<-rbind(high_youtube_norm,low_youtube_norm)
+index<-sd_youtube$index
+
+#join after cleaning outliers
+trending_start<-trending_start[index,]
+
+# check numerical features after normalizing
+youtube_norm_af <- data.frame(lapply(youtube_norm_basic[index,], z_normalize))
+
+# compare the numerical features before and after change
+summary(youtube_norm_af) 
+summary(youtube_norm)
+
+## better than before (the scaling differ)
+boxplot(log(youtube_norm_af))
+boxplot(log(youtube_norm))
+
+```
+
+
+
+
+#Numeric variable analysis
+
+#overall, the number of views, likes, dislikes and comment count in the first day as trending videos have an strong effect on their final views. but it is not linear relation between log of outcome and other potential variables in the standardlize scale. After transfroming them into logrithm scale, the relation become linear. Although, the proportion of likes and the total video views by channels relate with final views, in order to aviod multicolinearity problem, this research ignore them as model predictors.
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#let try standardlize variables and see if there are linear relationship between log final views and other variables
+#video related variables VS. log final views
+
+#the following 4 variables (views, likes, dislikes, comment count) have not linear relationship with log final views
+ggplot(trending_start)+aes(scale(views),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+ggplot(trending_start)+aes(scale(likes),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+ggplot(trending_start)+aes(scale(dislikes),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+ggplot(trending_start)+aes(scale(comment_count),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+```
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#let try log of them --> positive linear relation 
+gg2<-ggplot(trending_start)+aes(log(views),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+gg3<-ggplot(trending_start)+aes(log(likes),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+gg4<-ggplot(trending_start)+aes(log(dislikes),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+ggplot(trending_start)+aes(log(comment_count),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+```
+
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#by proportion 
+#the proportion of likes has postive correlation with outcome 
+ggplot(trending_start)+aes(likes/views,log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+#the proportion of dislike has negative relation with final views but not complete linear 
+ggplot(trending_start)+aes(dislikes/views,log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+#the proportion of comment count-->no abvious relation
+ggplot(trending_start)+aes(comment_count/views,log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+```
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#the log of proportion of like--> positive relation
+ggplot(trending_start)+aes(log(likes/views),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+#the proportion of dislike--> not linear 
+ggplot(trending_start)+aes(log(dislikes/views),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+#the log of proportion of comment count-->no abvious relation
+ggplot(trending_start)+aes(log(comment_count/views),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+
+```
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#the trending day has postive correlation with outcome
+ggplot(trending_start)+aes(trending_day,log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+# the number of tag has not abvious relation with outcome 
+ggplot(trending_start)+aes(tag_count,log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+```
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#channel feature VS. log of final views
+#the following channel relevant variables (subscriber, video upload, video views) have not linear relation with outcome 
+ggplot(trending_start)+aes(scale(Subscribers),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+ggplot(trending_start)+aes(scale(`Video Uploads`),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+ggplot(trending_start)+aes(scale(`Video views`),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+```
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#channel feature VS. log of final views
+#the following channel relevant variables (log of subscriber, video upload and video views) have not complete linear relation with outcome 
+#subscribers--> positive 
+gg5<-ggplot(trending_start)+aes(log(Subscribers),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+#video upload--> negative
+ggplot(trending_start)+aes(log(`Video Uploads`),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+#total video view--> slight positive 
+ggplot(trending_start)+aes(log(`Video views`),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+```
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#by proportion 
+# NOT Linear
+ggplot(trending_start)+aes((`Video views`/`Video Uploads`),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+ggplot(trending_start)+aes((`Video views`/Subscribers),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+```
+```{r}
+grid.arrange(gg2,gg3,gg4,gg5)
+```
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#by proportion 
+# positive relation
+ggplot(trending_start)+aes(log(`Video views`/`Video Uploads`),log(final_views))+geom_jitter(alpha=0.2)+geom_smooth()
+```
+
+#categorical factor analysis 
+#people commonly think the number of tags of a video affect the views, the more of tags attached, the video will be searched by any key words in tags, which means youtube users are more likely watch this video. However, the below boxplot shows a contradict result, which is there is no abvious pattern to proof the postive correlation.
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#tag_count-->there is no pattern 
+trending_start %>% filter(tag_count<53) %>% 
+  ggplot()+aes(factor(tag_count),log(final_views),fill=factor(tag_count))+geom_boxplot(show.legend = F)+theme(axis.text.x = element_text(angle = 90))
+```
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#video category & popular momth
+
+trending_start %>% group_by(category) %>% mutate(m_view=mean(log(final_views))) %>% 
+  ggplot()+aes(reorder(factor(category),m_view),log(final_views),fill=factor(category))+geom_boxplot(show.legend = F)+theme(axis.text.x = element_text(angle = 15))
+
+```
+#the boxplot shows there is difference in different video categories, the avarage of view in Music video was higher than other category. The following category is Film & Animation and Comedy. The category with lowest avarage views is News & Politics, which means only a few user would like to watch a News video in YouTube, they prefer to have fun with entertainment videos, like music, film and comedy. 
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+range(trending_start$trending_date)
+#month--> the data recorded from 2017-11-14 to 2018-06-13
+
+#redefine the month period 
+trending_start$month_c<-ifelse(trending_start$trending_date<"2017-12-14","2017-12",
+                               ifelse(trending_start$trending_date<"2018-01-14" &trending_start$trending_date>="2017-12-14","2018-01",
+                                      ifelse(trending_start$trending_date<"2018-02-14" & trending_start$trending_date>="2018-01-14","2018-02",
+                                             ifelse(trending_start$trending_date<"2018-03-14"& trending_start$trending_date>="2018-02-14","2018-03",
+                                                    ifelse(trending_start$trending_date<"2018-04-14" &trending_start$trending_date>="2018-03-14","2018-04",
+                                                           ifelse(trending_start$trending_date<"2018-05-14"& trending_start$trending_date>="2018-04-14","2018-05","2018-06"))))))
+
+ggplot(trending_start)+aes(factor(month_c),log(final_views),fill=factor(month_c))+geom_boxplot(show.legend = F)+theme(axis.text.x = element_text(angle = 15))
+
+```
+#the boxplot shows the variation of views by months, there is only a slight upward trend from Dec 2017 to June 2018. in order to understand more information, let check the interation of month and category. 
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#month
+trending_start %>% mutate(n=1) %>% group_by(category) %>% mutate(N=sum(n)) %>% filter(N>100) %>% ggplot()+aes(factor(month_c),fill=factor(category))+geom_bar(position = "fill")+theme(axis.text.x = element_text(angle = 15))
+```
+#the staked bar plot indicates the proportion of video category in trending list has not big changes by month, except the proportion of News & Politic video increased in 2018 Feb and March, then decreased in the following two month. it probably happened some special events or politics changes during these two months and appeal more people to know current news via youtube video. However, the aveage of views for news in these two months did not higher than other month. On the contrary, relatively less of news in April and May have a high aveage of views.
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+trending_start %>% filter(category=="News & Politics") %>% 
+  ggplot()+aes(factor(month_c),log(final_views))+geom_boxplot()+labs(x=NULL,y="Log of Final Views",title="Final Views of the News & Politics Videos Change by Month")
+
+trending_start %>% filter(category=="Music") %>% 
+  ggplot()+aes(factor(month_c),log(final_views))+geom_boxplot()
+
+trending_start %>% filter(category=="Entertainment") %>% 
+  ggplot()+aes(factor(month_c),log(final_views))+geom_boxplot()
+```
+
+#the channel VS. log of final views boxplot shows the variation of log views by different channels.
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#channel
+trending_start %>% mutate(n=1) %>% group_by(channel_title) %>% mutate(N=sum(n)) %>% mutate(view_channel=mean(log(final_views)))%>% filter(N>25) %>% 
+ggplot()+aes(reorder(factor(channel_title),view_channel),log(final_views))+geom_boxplot()+
+  theme(axis.text.x = element_text(angle = 20))
+```
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#channel grade-->no obvious variation by channel grade
+trending_start$grade_fac<-factor(trending_start$Grade, levels = c("B+","A-","A","A+","A++"),labels = c("Grade_B+","Grade_A-","Grade_A","Grade_A+","Grade_A++"))
+ggplot(trending_start)+aes(factor(grade_fac),log(final_views),fill=Grade)+geom_boxplot()
+```
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#reduce the variables
+names(trending_start)
+trending_start %<>% select(video_id,category,channel_title,month_c,trending_day,final_views,views,likes,dislikes,comment_count,Subscribers,`Video Uploads`)
+```
+```{r}
+
+
+  ggplot(trending_start)+aes(trending_day,log(final_views))+geom_point(alpha=0.7)+geom_smooth()+labs(x="Trending Days",y="Log of Final Views",title = "Log of Final Views VS. The Number of Trending Day")
+
+
+```
+
+#correlation among numeric variables
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+numeric_feature<-trending_start %>% ungroup() %>%  select(final_views,views,likes,dislikes,comment_count,Subscribers,`Video Uploads`)
+
+numeric_feature<-log(numeric_feature)
+numeric_feature$trending_day<-trending_start$trending_day
+corr<-cor(numeric_feature)
+
+ggcorrplot(corr, hc.order = F, type = "lower", lab = TRUE,
+           lab_size = 4, colors = c("tomato2", "white", "springgreen3"), 
+           title = "Correlation of Numerical features", 
+           ggtheme = theme_bw) +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 20,size = 10))
+```
+#this heat map shows many interesting things, overall, the log of final views has highly postive correlation with the log of views, likes and comment count in the first day as a trending video ("views","likes","comment_count"), the number of trending day ("trending_day"), the log of the number of subscriber of channel ("subscribers"). On the contrary, the log of the total number of video ("log_video_upload") for a specific channel has highly negative correlation with the final views, which means the video views increase slightly if the channel upload video frequently. meanwhile, it is easily to notice that the log of number of views, likes, dislikes and the comment count for a video are highly correlated. It tends to result in the multicollinearity problem.
+
+
+#fit model 
+#log-log linear regression model
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#step by step to find a best model with least predictors
+slm_1<-lm(log(final_views)~log(views)+log(likes)+log(dislikes+1)+log(comment_count)+log(Subscribers)+log(`Video Uploads`)+factor(trending_day)+factor(category)+factor(month_c),trending_start)
+summary(slm_1) #comment count and video upload are not significant 
+slm_2<-lm(log(final_views)~log(views)+log(likes)+log(dislikes+1)+log(Subscribers)+factor(trending_day)+factor(category)+factor(month_c),trending_start)
+summary(slm_2)
+anova(slm_1,slm_2)
+AIC(slm_1,slm_2)
+```
+#compare model 1 and model 2 with ANOVA table and AIC indicator, both of them show there is not significant difference after removing the two predictors-comment count and the number of vidoe upload.
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#check whether the interaction of category and month is necessary or not
+
+slm_3<-lm(log(final_views)~log(views)+log(likes)+log(dislikes+1)+log(Subscribers)+factor(trending_day)+factor(category)*factor(month_c),trending_start)
+
+AIC(slm_3,slm_2) #-->model 2
+anova(slm_3,slm_2) #-->no difference-->the degree of freedom of model 2 is less
+```
+#Applied AIC and ANOVA table to compare model 2 and model 3 to check the necessity of interaction of popular month and video category, the result shows there is no significant discrepancy in model with or without the interaction. in order to make the question more simplier, model 2 is more appropriate.
+
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+#check category and month is necessary or not?
+
+#without month
+slm_4<-lm(log(final_views)~log(views)+log(likes)+log(dislikes+1)+log(Subscribers)+factor(trending_day)+factor(category),trending_start)
+#without category
+slm_5<-lm(log(final_views)~log(views)+log(likes)+log(dislikes+1)+log(Subscribers)+factor(trending_day)+factor(month_c),trending_start)
+
+
+AIC(slm_2,slm_4,slm_5) #-->2 -->4
+anova(slm_2,slm_4,slm_5) #-->5-->2
+```
+#the AIC indicator demonstrates the model 2 is better than other, and ANOVA shows there is significant difference among the model 2 and other two models, them compare the RSS, the model 2 is the smallest. So model 2 seems the best one until now.
+
+
+#another way to select predictors is backward stepwise regression, which accords to AIC. Both of these two methods, give a same model.
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+stepAIC(slm_1,direction = "backward")
+```
+
+#multilevel regression model 
+
+#because this is a hierarchical structure dataset, the category of video, the trenidng days and channel can be seem as the group level, and each specific video is in the individual level. In this part, due to the constraint of dataset, trying to fit 2 kind of model, one is no polling model (the same with linear model 2), another one is partial polling model with no group level predictor. model 2 is no polling model, the fit result is good. model 3 and 4 is partion polling, but their group variance are to small (both of them are less than 0.1) by setting video categories or trending days as gourp level. Finally comparing AIC and BIC of models, it shows the no-polling model is more appropriate than partial polling model. 
+
+#no polling
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+ml_1<-lm(log(final_views)~log(views)+log(likes)+log(dislikes+1)+log(Subscribers)+factor(trending_day)+factor(category)+factor(month_c)-1, data = trending_start)
+#summary(ml_1)
+# the adjust r suqared is 0.9987
+coef(ml_1)
+```
+
+
+#partial pooling 
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+library(lme4)
+#varying-intercept model with no predictor 
+
+#set category as group
+ml_2<-lmer(log(final_views)~log(views)+log(likes)+log(dislikes+1)+log(Subscribers)+factor(trending_day)+factor(month_c)+(1|category),trending_start)
+summary(ml_2) 
+#the group level variance is too small
+
+#set trending days as group 
+ml_3<-lmer(log(final_views)~log(views)+log(likes)+log(dislikes+1)+log(Subscribers)+factor(category)+factor(month_c)+(1|trending_day),trending_start)
+summary(ml_3)
+#the group level variance is too small
+```
+
+
+#compare the models
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+BIC(ml_1,ml_2,ml_3)
+AIC(ml_1,ml_2,ml_3) 
+
+```
+#the model 1 is better
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+anova(ml_1,slm_2)
+```
+#no pooling model is the same with model 2
+
+
+#model check 
+
+#check the assumptions of linear regression model 
+
+#check the normality 
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+# Histogram overlaid with kernel density curve
+p1<-ggplot(trending_start,aes(x=log(final_views))) +geom_histogram(aes(y=..density..),binwidth=.3,colour="black", fill="white") + geom_density(alpha=.1, fill="#FF6666")+ geom_vline(aes(xintercept=mean(log(final_views), na.rm=T)),color="red", linetype="dashed", size=1) +labs(title="Distribution of Outcome",x="log(final_views)",y="Density") 
+
+p2<-ggplot(trending_start,aes(x=scale(final_views))) +geom_histogram(aes(y=..density..),binwidth=.3,colour="black", fill="white")
+#+ geom_density(alpha=.1, fill="#FF6666") +labs(title="Distribution of Outcome",x="log(final_views)",y="Density") 
+```
+
+p2<-ggplot(trending_start,aes(x=final_views)) +geom_histogram(aes(y=..density..),binwidth=.3,colour="black", fill="white") + geom_density(alpha=.1, fill="#FF6666")+ geom_vline(aes(xintercept=mean(log(final_views), na.rm=T)),color="red", linetype="dashed", size=1) +labs(title="Distribution of Outcome",x="log(final_views)",y="Density") p2
+  
+```{R}
+#histogram of residual
+resid<-data.frame(residuals(slm_2))
+p2<-ggplot(resid,aes(x=residuals.slm_2.)) +geom_histogram(aes(y=..density..),binwidth=.1,colour="black", fill="white") + geom_density(alpha=.1, fill="#FF6666")+ geom_vline(aes(xintercept=mean(residuals.slm_2., na.rm=T)),color="red", linetype="dashed", size=1) +labs(title="Distribution of Errors",x="Studentized Residual",y="Density") 
+
+grid.arrange(p1,p2)
+```
+
+
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+qqPlot(slm_2,labels=row.names(trending_start),id.method="identity",
+       simulation=TRUE,main="Q-Q Plot")
+```
+
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+trending_start[74,]
+fitted(slm_2)[74]
+residuals(slm_2)[74]
+rstudent(slm_2)[74]
+
+```
+# from the Q-Q plot, the two dashed lines is the  the most points locate in the 
+
+
+#check independence of error
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+durbinWatsonTest(slm_2)
+```
+#the test result of independence is not good, the p value is significant and the independent hypothesis should be rejected. it probably cause there is competitive relationship among trending videos and in the same day, the views of a video is affected by the performance of the similar category videos to some extend.
+
+
+#check homoscedasticity
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+ncvTest(slm_2)
+spreadLevelPlot(slm_2)
+```
+#the ncvtest result show the same vaiance hypothsis is invaild.
+
+#check multicollinearity --VIF (variance inflation factor)
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+vif(slm_2)
+sqrt(vif(slm_2))>2
+```
+#The square of VIF are less than 2, which means there is no multicollinearity problem in the model.
+
+#check outlier and influential abservation
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+outlierTest(slm_2)
+
+influencePlot(slm_2,id.method="identity",main="Influence Plot",
+              sub="Circle size is proportional to Cook's distance")
+```
+#from the influence plot, it is clear to see there are some outliers (studentized residuals bigger than the range of -2 to +2) and strong influential abservations (the radius of circles is bigger than others), like row 1885 and 1924 with a relative large circle. then try to refit the model after removing the unusual points. these points will affect the estimantion of model coefficients.
+
+
+#refit model again and again
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+                                                                                                                 
+slm_2.2<-lm(log(final_views)~log(views)+log(likes)+log(dislikes+1)+log(Subscribers)+factor(trending_day)+factor(category)+factor(month_c),trending_start[-c(29,223,859,883),])
+summary(slm_2.2)
+
+outlierTest(slm_2.2)
+
+influencePlot(slm_2.2,id.method="identity",main="Influence Plot",
+              sub="Circle size is proportional to Cook's distance")
+
+```
+
+#After cleaning a part of outliers and infuential point, the model becomes better from the above 4 plots. 
+
+
+#cross-validation -- 20% VS. 80% principle
+
+```{r,warning=FALSE,error=FALSE,echo=FALSE}
+set.seed(100)
+trending_start<- trending_start[-c(29,223,859,883),]
+#create train and test set seperately according to 2-8 principle
+index<-sample(1:dim(trending_start)[1],416)
+test_set<-trending_start[index,]
+train_set<-trending_start[-index,]
+
+model<-lm(log(final_views)~log(views)+log(likes)+log(dislikes+1)+log(Subscribers)+factor(trending_day)+factor(category)+factor(month_c),train_set)
+
+model_predict<-predict(model,test_set)
+var(log(test_set$final_views),model_predict)  #2.068
+gg_model<-data.frame(cbind(model_predict,log(test_set$final_views)))
+
+
+ggplot(gg_model)+aes(model_predict)+geom_histogram(binwidth = 0.5,color="white",alpha=0.3,fill="red")+geom_histogram(aes(x =V2),binwidth = 0.5,color="white",alpha=0.8,fill="grey")+theme_bw()
+
+ggplot(gg_model)+aes(model_predict)+geom_density(binwidth = 0.5,color="red",linetype="dashed",alpha=0.1,fill="red")+geom_density(aes(x =V2),binwidth = 0.5,color="black")+theme_bw()
+
+t.test(gg_model$model_predict,gg_model$V2)
+```
+
+
+
+#K-fold cross-validation 
+
+library(bootstrap)
+shrinkage <-function(fit,k=10){
+  require(bootstrap)
+  theta.fit<-function(x,y){lsfit(x,y)}
+  theta.predict<-function(fit,x){cbind(1,x)%*%fit$coef}
+  
+  x<-fit$model[,2:ncol(fit$model)]
+  y<-fit$model[,1]
+  
+  results<-crossval(x,y,theta.fit,theta.predict, ngroup=k)
+  r2<-cor(y,fit$fitted.values)^2
+  r2cv<-cor(y,results$cv.fit)^2
+  cat("original R-square =",r2,"\n")
+  cat(k,"Fold Cross-Validated R-Square =",r2cv,"\n")
+  cat("change =",r2-r2cv,"\n")
+}
+shrinkage(slm_2.2)
+
+```
+# from the plot 
